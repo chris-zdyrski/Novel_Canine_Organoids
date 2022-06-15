@@ -1,0 +1,349 @@
+---
+title: "Differential gene expresion analysis of organoids vs. other organoids"
+output: html_notebook
+---
+
+```{r include=F}
+library('tidyverse')
+library('edgeR')
+library('ComplexHeatmap')
+library('VennDiagram')
+library('Vennerable')
+```
+
+Specify count data file path, read it, and format
+```{r}
+countsFp = '../data/rnaseq_sample_counts.txt'
+counts_df = read_delim(countsFp, delim='\t', skip=1, show_col_types=F) %>% 
+  select(-c(2:6)) %>% 
+  janitor::clean_names()
+
+colnames(counts_df) = gsub("work_las_nvalenzu_lab_collaboration_read_mapping_star_", "", colnames(counts_df)) %>%
+  gsub("aligned_sorted_by_coord_out_bam", "", .) %>% 
+  gsub("_$", '', .)
+```
+
+Remove samples from data set
+```{r}
+counts_df = counts_df[, !grepl("_1$|_2$|ovary|tissue", colnames(counts_df))]
+```
+
+Extract spike-in counts
+```{r}
+ercc_df = counts_df %>%
+  filter(grepl('^ERCC-', .$geneid))
+
+counts_df = counts_df %>%
+  filter(!grepl('^ERCC-', .$geneid))
+```
+
+Create table with sample groups
+```{r}
+samplemeta = tibble(sample=colnames(counts_df[, -1])) %>%
+  mutate(group=str_extract(sample, pattern="_[_a-z]+") %>%
+           gsub("^_|_$", "", .)) %>%
+  mutate(ind=str_extract(sample, pattern="b[0-9]+"))
+```
+
+Calculate normalization factors from spike-ins
+```{r}
+normfactors = calcNormFactors(column_to_rownames(ercc_df, var='geneid'))
+```
+
+Create DGEList from counts and sample groups
+```{r}
+counts = DGEList(counts=column_to_rownames(counts_df, var='geneid'), 
+                 norm.factors=normfactors,
+                 group=samplemeta$group)
+```
+
+Plot raw and normalized counts for comparison
+```{r include=F, message=F}
+logcounts = cpm(counts, log=T, prior.count=0.5) %>%
+  as.data.frame() %>%
+  rownames_to_column(var='gene')
+cpm_p = list()
+for(i in colnames(counts)){
+  cpm_p[[i]] = ggplot(counts_df, aes_string(x=i)) + 
+    geom_histogram() #+
+    #xlab(i)
+  
+  cpm_p[[paste0(i, '_log')]] = ggplot(logcounts, aes_string(x=i)) + 
+    geom_histogram() #+
+    #xlab(i)
+}
+pdf('../results/organoid_vs_organoid/density_raw_and_logCPM.pdf')
+ggpubr::ggarrange(plotlist=cpm_p, ncol=2,nrow=2)
+dev.off()
+```
+
+Generate MDS for all samples
+```{r}
+# Filter lowly expressed genes
+keep = filterByExpr(counts, group=counts$samples$group)
+countsFilter = counts[keep, ]
+mds = plotMDS(countsFilter, plot=F)
+mds_df = tibble(sample=colnames(countsFilter),
+                group=samplemeta$group,
+                dog=samplemeta$ind,
+                dim1=mds$x,
+                dim2=mds$y)
+
+pdf('../results/organoid_vs_organoid/MDS_expr_profiles.pdf', width=9, height=7)
+ggplot(mds_df, aes(x=dim1, y=dim2, color=group, shape=dog, label=group)) +
+  geom_point(size=4) +
+  ggrepel::geom_text_repel(color='black') +
+  xlab(paste0("Dim1 - Explained var=", round(mds$var.explained[1] * 100, 1), '%')) +
+  ylab(paste0("Dim2 - Explained var=", round(mds$var.explained[2] * 100, 1), '%')) +
+  ggtitle('Multidimensional scaling plot of log gene expression') +
+  khroma::scale_color_discreterainbow()
+dev.off()
+```
+
+Detect DE genes
+```{r}
+tissues = c('bladder', 'endometrium', 'kidney', 'liver', 'lung', 'pancreas')
+pval_h = list()
+all_tests = list()
+# Create design matrix
+design = model.matrix(~0 + samplemeta$group)
+colnames(design) = c(as.vector(na.omit(str_replace(colnames(design), 'samplemeta\\$group', ''))))
+rownames(design) = colnames(counts)
+keep = filterByExpr(counts, design=design)
+counts_tmp = counts[keep, ]
+counts_tmp = estimateDisp(counts_tmp, design, robust=T)
+for(i in tissues){
+  
+  expr_tmp = paste0(i, '_organoid-', '(', 
+                    paste0(grep(i, colnames(design), value=T, invert=T), collapse='+'),
+                    ')/5', collapse='')
+  contrast_tmp = makeContrasts(expr_tmp, levels=design)
+  
+  fit = glmQLFit(counts_tmp, design)
+  
+  qlft = glmQLFTest(fit, contrast=contrast_tmp)
+  
+  # Plot histogram of nominal pvalues
+  pval_h[[i]] = ggplot(qlft$table) + 
+    geom_histogram(aes(x=PValue)) +
+    ggtitle(i)
+  
+  # Use two methods for multiple sample comparison p value correction
+  topDE_Holm = topTags(qlft, n=40000, adjust.method='holm')
+  topDE_BH = topTags(qlft, n=40000, adjust.method='BH')
+  
+  all_tests[[i]] = list(BH=topDE_BH, Holm=topDE_Holm)
+  
+  de_list = list(
+    DEGenes_BH = topDE_BH$table %>%
+      rownames_to_column('gene_symbol') %>%
+      mutate(abslogFC=abs(.$logFC)) %>%
+      arrange(FDR, desc(abslogFC)) %>%
+      filter(FDR < 0.05) %>%
+      select(-abslogFC),
+    DEGenes_Holm = topDE_Holm$table %>%
+      rownames_to_column('gene_symbol') %>%
+      mutate(abslogFC=abs(.$logFC)) %>%
+      arrange(FWER, desc(abslogFC)) %>%
+      filter(FWER < 0.05) %>%
+      select(-abslogFC),
+    Non_DEGenes_BH = topDE_BH$table %>%
+      rownames_to_column('gene_symbol') %>%
+      arrange(desc(logCPM)) %>%
+      filter(FDR >= 0.05) %>%
+      filter(logCPM > quantile(.$logCPM, 0.5)),
+    Non_DEGenes_Holm = topDE_Holm$table %>%
+      rownames_to_column('gene_symbol') %>%
+      arrange(desc(logCPM)) %>%
+      filter(FWER >= 0.05) %>%
+      filter(logCPM > quantile(.$logCPM, 0.5))
+  )
+  
+  #openxlsx::write.xlsx(x=de_list, paste0(file='../results/organoid_vs_organoid/top_DE_genes_', i, '_vs_organoids.xlsx'))
+}
+
+#pdf('../results/organoid_vs_organoid/p_value_histograms.pdf')
+ggpubr::ggarrange(plotlist=pval_h, nrow=n2mfrow(length(pval_h))[1], ncol=n2mfrow(length(pval_h))[2])
+#dev.off()
+```
+
+Generate heatmaps
+```{r}
+fps = list.files('../results/organoid_vs_organoid/', pattern='xlsx', full.names=T)
+hm_BH = list()
+hm_Holm = list()
+for(i in tissues){
+  
+  degenes_BH = readxl::read_excel(grep(i, fps, value=T), sheet=1) %>%
+    #filter(logFC <= quantile(.$logFC, 0.01) | logFC >= quantile(.$logFC, 0.99))
+    filter(logFC >= quantile(.$logFC, 0.99))
+  
+  degenes_Holm = readxl::read_excel(grep(i, fps, value=T), sheet=2) %>%
+    #filter(logFC <= quantile(.$logFC, 0.01) | logFC >= quantile(.$logFC, 0.99))
+    filter(logFC >= quantile(.$logFC, 0.99))
+  
+  if(nrow(degenes_BH) > 0){
+    mtx_BH = cpm(countsFilter$counts, log=T, prior.count=0.5) %>%
+      as.data.frame() %>%
+      #select(grep(i, colnames(.))) %>%
+      rownames_to_column(var='gene_symbol') %>%
+      right_join(., degenes_BH[, c(1,2,6)], by='gene_symbol') %>%
+      arrange(logFC) %>%
+      filter(FDR < 0.01) %>%
+      select(-c(logFC, FDR)) #%>%
+      #column_to_rownames(var='gene_symbol') %>%
+      #as.matrix()
+    colnames(mtx_BH) = gsub('anoid', '', colnames(mtx_BH))
+    hm_BH[[i]] = mtx_BH
+  }
+  
+  if(nrow(degenes_Holm) > 0){
+    mtx_Holm = cpm(countsFilter$counts, log=T, prior.count=0.5) %>%
+      as.data.frame() %>%
+      #select(grep(i, colnames(.))) %>%
+      rownames_to_column(var='gene_symbol') %>%
+      right_join(., degenes_Holm[, c(1,2,6)], by='gene_symbol') %>%
+      arrange(logFC) %>%
+      filter(FWER < 0.05) %>%
+      select(-c(logFC, FWER)) #%>%
+      #column_to_rownames(var='gene_symbol') %>%
+      #as.matrix()
+    colnames(mtx_Holm) = gsub('anoid', '', colnames(mtx_Holm))
+    hm_Holm[[i]] = mtx_Holm
+  }
+  
+}
+
+BH_DE = tibble()
+for(i in tissues){
+  BH_DE = bind_rows(BH_DE, hm_BH[[i]])
+}
+BH_DE = BH_DE %>%
+  filter(!duplicated(gene_symbol)) %>%
+  filter(!str_detect(gene_symbol, '^LOC[0-9]+$')) %>%
+  column_to_rownames(var='gene_symbol')
+
+holm_DE = tibble()
+for(i in tissues){
+  holm_DE = bind_rows(holm_DE, hm_Holm[[i]])
+}
+holm_DE = holm_DE %>%
+  filter(!duplicated(gene_symbol)) %>%
+  filter(!str_detect(gene_symbol, '^LOC[0-9]+$')) %>%
+  column_to_rownames(var='gene_symbol')
+
+hm_BH = Heatmap(scale(BH_DE, center=F), cluster_rows=F,
+                column_title=paste0(i, ' DE genes, Benjamini-Hochberg/FDR<0.01; logFC>=qt0.99'),
+                name='norm_expr')
+
+hm_Holm = Heatmap(scale(holm_DE, center=F), cluster_rows=F, 
+                  column_title=paste0(i, ' DE genes, Holm/FWER<0.05; logFC>=qt0.99'),
+                  name='norm_expr')
+```
+
+Write heatmaps to file
+```{r}
+pdf(paste0('../results/organoid_vs_organoid/DE_genes_organoid_vs_organoid_BHPadjust.pdf'), height=30, pointsize=8)
+print(hm_BH)
+dev.off()
+```
+
+```{r}
+pdf(paste0('../results/organoid_vs_organoid/DE_genes_organoid_vs_organoid_HolmPadjust.pdf'))
+print(hm_Holm)
+dev.off()
+```
+
+Venn diagrams
+```{r include=F}
+fps = list.files('../results/organoid_vs_organoid/', pattern='xlsx', full.names=T)
+org_Up = list()
+for(i in tissues){
+  
+  degenes_BH = readxl::read_excel(grep(i, fps, value=T), sheet=1) %>%
+    arrange(logFC)
+  
+  org_Up[[i]] = degenes_BH$gene_symbol[degenes_BH$logFC > 0 & degenes_BH$FDR < 0.01]
+}
+
+venn_BH = venn.diagram(x=org_Up[-4], disable.logging=T, filename=NULL,
+                       cat.pos=c(0, 350, 216, 144, 50),
+                       main='DE Up genes in organoids - BH/FDR < 0.01',
+                       fill=khroma::color('discrete rainbow')(5))
+
+pdf('../results/organoid_vs_organoid/organoid_DE_up_genes.pdf')
+grid.draw(venn_BH)
+dev.off()
+
+v1 = Venn(org_Up)
+pdf('../results/organoid_vs_organoid/organoid_DE_up_genes_6setVenn.pdf')
+plot(v1, doWeights=FALSE)
+dev.off()
+
+# Read Diff gene expression results to sort intersections by logFC
+degstats = tibble()
+for(i in tissues){
+  degstats = degstats %>%
+    bind_rows(readxl::read_excel(grep(i, fps, value=T), sheet=1))
+}
+degstats = degstats %>%
+    dplyr::select(gene_symbol, logCPM, logFC, FDR) %>%
+    #mutate(abs_logFC=abs(logFC)) %>%
+    #arrange(gene_symbol, desc(abs_logFC))
+    arrange(gene_symbol, desc(logCPM)) %>%
+    filter(logFC > 0 & FDR < 0.01) %>%
+    dplyr::select(-FDR)
+degstats = degstats[!duplicated(degstats$gene_symbol), ]
+
+# Save combinations of intersections for organoids
+vennInts = list()
+for(i in 1:length(org_Up)){
+  # Get table with all possible combinations of elements, selecting i number of elemets at a time
+  combs = combn(1:length(org_Up), i)
+  for(j in 1:ncol(combs)){
+    # Get the complement to the intersection (will be substracted from result)
+    comp = c(1:length(org_Up))[!(1:length(org_Up) %in% combs[, j])]
+    # Get name of intersection
+    nameint = paste0(sort(names(org_Up)[combs[, j]]), collapse='_')
+    # Get intersection of all elements in combs[, j]
+    vennInts[[nameint]] = Reduce(intersect, org_Up[combs[, j]])
+    # Substract complement
+    vennInts[[nameint]] = vennInts[[nameint]][!(vennInts[[nameint]] %in% unlist(org_Up[comp]))]
+    vennInts[[nameint]] = degstats[degstats$gene_symbol %in% vennInts[[nameint]], ] %>%
+      arrange(desc(logCPM))
+      #dplyr::select(-abs_logFC)
+    vennInts[[nameint]] = bind_rows(tibble(gene_symbol=nameint, logCPM=NA, logFC=NA), vennInts[[nameint]])
+  }
+}
+names(vennInts) = seq(1, length(vennInts))
+openxlsx::write.xlsx(x=vennInts, file="../results/organoid_vs_organoid/organoid_DE_up_genes_6setVenn_Intersections.xlsx")
+```
+
+Do MDS diagram of DE genes
+```{r}
+# Merge all DE genes from all comparisons
+degenes = unique(unlist(org_Up))
+
+# Filter lowly expressed genes
+keep = filterByExpr(counts, group=counts$samples$group)
+countsFilterMDS = counts[keep, ]
+countsFilterMDS = countsFilterMDS[rownames(countsFilterMDS) %in% degenes, ]
+
+mdsDEGenes = plotMDS(countsFilterMDS, plot=F)
+mdsDEGenes_df = tibble(sample=colnames(countsFilterMDS),
+                group=samplemeta$group,
+                dog=samplemeta$ind,
+                dim1=mdsDEGenes$x,
+                dim2=mdsDEGenes$y)
+
+pdf('../results/organoid_vs_organoid/MDS_expr_profiles_OnlyDEGenes.pdf', width=9, height=7)
+ggplot(mdsDEGenes_df, aes(x=dim1, y=dim2, color=group, shape=dog, label=group)) +
+  geom_point(size=4) +
+  ggrepel::geom_text_repel(color='black') +
+  xlab(paste0("Dim1 - Explained var=", round(mdsDEGenes$var.explained[1] * 100, 1), '%')) +
+  ylab(paste0("Dim2 - Explained var=", round(mdsDEGenes$var.explained[2] * 100, 1), '%')) +
+  ggtitle('Multidimensional scaling plot of log gene expression') +
+  khroma::scale_color_discreterainbow()
+dev.off()
+```
+
